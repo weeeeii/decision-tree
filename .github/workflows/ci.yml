@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка зависимостей
+        run: sudo apt-get install -y cmake gcc
+
+      - name: Конфигурация
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Сборка
+        run: cmake --build build
+
+      - name: Запуск тестов
+        run: ctest --test-dir build --output-on-failure -V
+
+      - name: Демо
+        run: ./build/robot_dt demo
+
+      - name: Обучение на CSV
+        run: ./build/robot_dt train data/robot.csv 10 5

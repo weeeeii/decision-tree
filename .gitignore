@@ -1,0 +1,8 @@
+build/
+robot_dt
+*.o
+*.gcda
+*.gcno
+*.gcov
+cov.info
+coverage_html/
