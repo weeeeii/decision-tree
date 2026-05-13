@@ -1,4 +1,4 @@
-# Decision Tree with Bagging на C
+# Реализация дерева решений с бэггингом на C
 
 Проект реализует классификатор команд управления роботом на языке C. В основе лежит дерево решений CART с критерием Джини, случайной подвыборкой признаков на каждом узле и ансамблем деревьев по методу bagging.
 
@@ -61,23 +61,6 @@ sqrt(number_of_features)
 BaggingClassifier обучает несколько деревьев. Для каждого дерева создается bootstrap-выборка: объекты выбираются случайно с возвращением.
 
 Финальное предсказание выбирается большинством голосов деревьев ансамбля.
-
-## Структура проекта
-
-```text
-decision_tree/
-├── CMakeLists.txt          # основная конфигурация сборки
-├── README.md               # описание проекта
-├── data/
-│   └── robot.csv           # пример обучающего датасета
-├── src/
-│   ├── decision_tree.h     # публичные структуры и функции
-│   ├── decision_tree.c     # реализация алгоритма
-│   └── main.c              # консольный интерфейс
-└── tests/
-    ├── CMakeLists.txt      # сборка тестов
-    └── test_all.c          # unit- и интеграционные тесты
-```
 
 ## Требования
 
@@ -208,64 +191,6 @@ ctest --test-dir build --output-on-failure -V
 86 passed, 0 failed
 100% tests passed, 0 tests failed out of 1
 ```
-
-## Основные функции API
-
-Файл `src/decision_tree.h` содержит публичный интерфейс проекта.
-
-### Работа с датасетом
-
-```c
-Dataset *dataset_alloc(size_t n_samples, size_t n_features, int n_classes);
-Dataset *dataset_load_csv(const char *path, int has_header);
-void dataset_free(Dataset *ds);
-```
-
-### Дерево решений
-
-```c
-DecisionTree *dt_create(size_t max_depth, int min_samples_split,
-                        int n_features_split, unsigned int seed);
-void dt_fit(DecisionTree *dt, const Dataset *ds,
-            const int *indices, size_t n_idx);
-int dt_predict(const DecisionTree *dt, const double *x);
-void dt_free(DecisionTree *dt);
-```
-
-### Bagging-классификатор
-
-```c
-BaggingClassifier *bag_create(size_t n_trees, size_t max_depth,
-                              int min_samples_split, unsigned int seed);
-void bag_fit(BaggingClassifier *bc, const Dataset *ds);
-int bag_predict(const BaggingClassifier *bc, const double *x);
-double bag_score(const BaggingClassifier *bc, const Dataset *ds);
-void bag_free(BaggingClassifier *bc);
-```
-
-## Текущий статус проекта
-
-Проект можно считать готовым как учебную реализацию дерева решений с bagging:
-
-- код собирается через CMake;
-- есть консольная программа;
-- есть пример датасета;
-- реализованы дерево решений, случайная подвыборка признаков и bagging;
-- есть автоматические тесты;
-- тесты проходят без ошибок;
-- README теперь описывает назначение, запуск, формат данных и ограничения.
-
-## Возможные улучшения
-
-Эти пункты не мешают сдаче базовой версии, но могут быть добавлены позже:
-
-- сохранение и загрузка обученной модели;
-- отдельное разделение данных на train/test вместо оценки только на обучающей выборке;
-- более строгий CSV-парсер с обработкой кавычек и пропущенных значений;
-- вывод структуры обученного дерева;
-- настройка `min_samples_split` через CLI;
-- расчет дополнительных метрик качества: precision, recall, F1-score;
-- генерация отчета о покрытии тестами.
 
 ## Быстрая проверка
 
