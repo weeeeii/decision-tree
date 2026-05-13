@@ -1,5 +1,7 @@
 build/
 robot_dt
+.DS_Store
+mnt/
 *.o
 *.gcda
 *.gcno
