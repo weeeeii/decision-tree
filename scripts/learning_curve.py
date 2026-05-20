@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""Save a simple learning curve for the C bagging executable.
-
-The script intentionally uses only the Python standard library. It runs
-robot_dt with several ensemble sizes, saves numeric results to CSV, and writes
-an SVG plot that can be opened in a browser or inserted into a report.
-"""
-
 from __future__ import annotations
 
 import csv
