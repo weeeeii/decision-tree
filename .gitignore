@@ -2,6 +2,7 @@ build/
 robot_dt
 .DS_Store
 mnt/
+Дерево Решений /
 *.o
 *.gcda
 *.gcno

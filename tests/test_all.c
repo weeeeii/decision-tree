@@ -40,6 +40,20 @@ static Dataset *make_simple_ds(void)
     return ds;
 }
 
+static Dataset *make_regression_ds(void)
+{
+    Dataset *ds = dataset_alloc(8, 1, 1);
+    if (!ds) return NULL;
+    ds->is_regression = 1;
+    double xs[] = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
+    double ys[] = {1.0, 2.0, 3.0, 4.0, 8.0, 10.0, 12.0, 14.0};
+    for (int i = 0; i < 8; i++) {
+        ds->X[i][0] = xs[i];
+        ds->y_reg[i] = ys[i];
+    }
+    return ds;
+}
+
 // Dataset
 
 TEST(test_dataset_alloc_free)
@@ -90,6 +104,23 @@ TEST(test_dataset_load_csv_no_header)
     ASSERT_NOT_NULL(ds);
     ASSERT_EQ(ds->n_samples, 3u);
     ASSERT_EQ(ds->n_classes, 2);
+    dataset_free(ds);
+}
+
+TEST(test_dataset_load_csv_regression)
+{
+    const char *path = "/tmp/dt_reg.csv";
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "x,target\n1.0,2.5\n2.0,5.0\n3.0,7.5\n");
+    fclose(f);
+
+    Dataset *ds = dataset_load_csv_regression(path, 1);
+    ASSERT_NOT_NULL(ds);
+    ASSERT_EQ(ds->is_regression, 1);
+    ASSERT_EQ(ds->n_samples, 3u);
+    ASSERT_EQ(ds->n_features, 1u);
+    ASSERT_NEAR(ds->y_reg[2], 7.5, 1e-9);
     dataset_free(ds);
 }
 
@@ -192,6 +223,37 @@ TEST(test_dt_fit_predict_trivial)
     double x0[1] = {0.5}, x1[1] = {3.5};
     ASSERT_EQ(dt_predict(dt, x0), 0);
     ASSERT_EQ(dt_predict(dt, x1), 1);
+    dt_free(dt);
+    dataset_free(ds);
+}
+
+TEST(test_dt_fit_predict_entropy)
+{
+    Dataset *ds = make_simple_ds();
+    ASSERT_NOT_NULL(ds);
+    int all[] = {0, 1, 2, 3, 4, 5};
+    DecisionTree *dt = dt_create_ex(5, 2, 1, 1u,
+                                    DT_TASK_CLASSIFICATION,
+                                    DT_CRITERION_ENTROPY);
+    dt_fit(dt, ds, all, 6);
+    double x0[1] = {0.5}, x1[1] = {3.5};
+    ASSERT_EQ(dt_predict(dt, x0), 0);
+    ASSERT_EQ(dt_predict(dt, x1), 1);
+    dt_free(dt);
+    dataset_free(ds);
+}
+
+TEST(test_dt_fit_predict_regression)
+{
+    Dataset *ds = make_regression_ds();
+    ASSERT_NOT_NULL(ds);
+    int all[8]; for (int i = 0; i < 8; i++) all[i] = i;
+    DecisionTree *dt = dt_create_ex(4, 2, 1, 3u,
+                                    DT_TASK_REGRESSION,
+                                    DT_CRITERION_MSE);
+    dt_fit(dt, ds, all, 8);
+    ASSERT_TRUE(dt_predict_value(dt, ds->X[0]) < 4.0);
+    ASSERT_TRUE(dt_predict_value(dt, ds->X[7]) > 8.0);
     dt_free(dt);
     dataset_free(ds);
 }
@@ -305,6 +367,35 @@ TEST(test_bag_fit_predict_trivial)
     double x0[1] = {0.5}, x1[1] = {3.5};
     ASSERT_EQ(bag_predict(bc, x0), 0);
     ASSERT_EQ(bag_predict(bc, x1), 1);
+    bag_free(bc);
+    dataset_free(ds);
+}
+
+TEST(test_bag_random_vote_subset)
+{
+    Dataset *ds = make_simple_ds();
+    BaggingClassifier *bc = bag_create_ex(9, 5, 2, 42u,
+                                          DT_TASK_CLASSIFICATION,
+                                          DT_CRITERION_ENTROPY, 3);
+    bag_fit(bc, ds);
+    ASSERT_EQ(bc->n_vote_trees, 3u);
+    double x0[1] = {0.5}, x1[1] = {3.5};
+    ASSERT_EQ(bag_predict(bc, x0), 0);
+    ASSERT_EQ(bag_predict(bc, x1), 1);
+    bag_free(bc);
+    dataset_free(ds);
+}
+
+TEST(test_bag_regression_rmse)
+{
+    Dataset *ds = make_regression_ds();
+    BaggingClassifier *bc = bag_create_ex(20, 5, 2, 42u,
+                                          DT_TASK_REGRESSION,
+                                          DT_CRITERION_MSE, 10);
+    bag_fit(bc, ds);
+    ASSERT_TRUE(bag_rmse(bc, ds) < 4.0);
+    double pred = bag_predict_value(bc, ds->X[7]);
+    ASSERT_TRUE(pred > 7.0);
     bag_free(bc);
     dataset_free(ds);
 }
@@ -440,6 +531,7 @@ int main(void)
     RUN(test_dataset_alloc_free);
     RUN(test_dataset_load_csv);
     RUN(test_dataset_load_csv_no_header);
+    RUN(test_dataset_load_csv_regression);
     RUN(test_dataset_load_csv_bad_path);
 
     RUN(test_gini_pure);
@@ -455,6 +547,8 @@ int main(void)
     RUN(test_dt_create_free);
     RUN(test_dt_create_defaults);
     RUN(test_dt_fit_predict_trivial);
+    RUN(test_dt_fit_predict_entropy);
+    RUN(test_dt_fit_predict_regression);
     RUN(test_dt_predict_no_root);
     RUN(test_dt_fit_all_same_class);
     RUN(test_dt_fit_depth_one);
@@ -464,6 +558,8 @@ int main(void)
 
     RUN(test_bag_create_free);
     RUN(test_bag_fit_predict_trivial);
+    RUN(test_bag_random_vote_subset);
+    RUN(test_bag_regression_rmse);
     RUN(test_bag_score_perfect);
     RUN(test_bag_score_empty_dataset);
     RUN(test_bag_single_tree);

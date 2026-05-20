@@ -54,6 +54,14 @@ Dataset *dataset_alloc(size_t n_samples, size_t n_features, int n_classes)
         return NULL;
     }
 
+    ds->y_reg = (double *)calloc(n_samples, sizeof(double));
+    if (!ds->y_reg) {
+        free(ds->y);
+        for (size_t i = 0; i < n_samples; i++) free(ds->X[i]);
+        free(ds->X); free(ds);
+        return NULL;
+    }
+
     ds->n_samples  = n_samples;
     ds->n_features = n_features;
     ds->n_classes  = n_classes;
@@ -68,6 +76,7 @@ void dataset_free(Dataset *ds)
         free(ds->X);
     }
     free(ds->y);
+    free(ds->y_reg);
     free(ds);
 }
 
@@ -176,6 +185,64 @@ cleanup_nomem:
     return NULL;
 }
 
+// загрузка CSV для регрессии: последний столбец — числовая целевая переменная
+Dataset *dataset_load_csv_regression(const char *path, int has_header)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return NULL; }
+
+    char line[4096];
+    size_t n_lines = 0;
+    int n_cols = -1;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (n_lines == 0 && has_header) { n_lines++; continue; }
+        if (n_cols < 0) {
+            n_cols = 1;
+            for (char *p = line; *p; p++)
+                if (*p == ',') n_cols++;
+        }
+        n_lines++;
+    }
+    rewind(f);
+
+    if (n_cols < 2 || n_lines == 0) { fclose(f); return NULL; }
+    size_t n_features = (size_t)(n_cols - 1);
+    size_t n_data = n_lines - (has_header ? 1u : 0u);
+    if (n_data == 0) { fclose(f); return NULL; }
+
+    Dataset *ds = dataset_alloc(n_data, n_features, 1);
+    if (!ds) { fclose(f); return NULL; }
+    ds->is_regression = 1;
+    strncpy(ds->class_names[0], "target", DT_LABEL_LEN - 1);
+
+    size_t row = 0;
+    int skip_header = has_header;
+    while (fgets(line, sizeof(line), f) && row < n_data) {
+        if (skip_header) { skip_header = 0; continue; }
+
+        char *tok = strtok(line, ",\n\r");
+        size_t col = 0;
+        while (tok && col < (size_t)n_cols) {
+            while (isspace((unsigned char)*tok)) tok++;
+            char *end = tok + strlen(tok) - 1;
+            while (end > tok && isspace((unsigned char)*end)) *end-- = '\0';
+
+            if (col < n_features)
+                ds->X[row][col] = atof(tok);
+            else
+                ds->y_reg[row] = atof(tok);
+
+            col++;
+            tok = strtok(NULL, ",\n\r");
+        }
+        row++;
+    }
+
+    fclose(f);
+    return ds;
+}
+
 //  Метрики неоднородности 
 
 // индекс Джини: G = 1 - sum(p^2)
@@ -225,21 +292,53 @@ static int majority(const int *counts, int n_classes)
     return best;
 }
 
+static double mean_target(const double *y, const int *idx, size_t n)
+{
+    double s = 0.0;
+    for (size_t i = 0; i < n; i++) s += y[idx[i]];
+    return n > 0 ? s / (double)n : 0.0;
+}
+
+static double mse_target(const double *y, const int *idx, size_t n)
+{
+    if (n == 0) return 0.0;
+    double m = mean_target(y, idx, n);
+    double e = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double d = y[idx[i]] - m;
+        e += d * d;
+    }
+    return e / (double)n;
+}
+
 // создание листового узла
-static DTNode *make_leaf(const int *y, const int *idx, size_t n, int n_classes)
+static DTNode *make_leaf(const Dataset *ds, const int *idx, size_t n)
 {
     DTNode *node = (DTNode *)calloc(1, sizeof(DTNode));
     if (!node) return NULL;
     node->is_leaf   = 1;
-    node->n_classes = n_classes;
-    count_classes(y, idx, n, node->class_counts, n_classes);
-    node->class_label = majority(node->class_counts, n_classes);
+    node->n_classes = ds->n_classes;
+    if (ds->is_regression) {
+        node->value = mean_target(ds->y_reg, idx, n);
+    } else {
+        count_classes(ds->y, idx, n, node->class_counts, ds->n_classes);
+        node->class_label = majority(node->class_counts, ds->n_classes);
+    }
     return node;
+}
+
+static double class_impurity(const int *counts, int n_classes, int total,
+                             DTCriterion criterion)
+{
+    if (criterion == DT_CRITERION_ENTROPY)
+        return dt_entropy(counts, n_classes, total);
+    return dt_gini(counts, n_classes, total);
 }
 
 // поиск лучшего разбиения по случайному подмножеству признаков
 static int find_best_split(const Dataset *ds, const int *idx, size_t n,
                             int n_feat_try, unsigned int *rng,
+                            DTCriterion criterion,
                             int *out_feat, double *out_thr)
 {
     int n_classes  = ds->n_classes;
@@ -253,11 +352,12 @@ static int find_best_split(const Dataset *ds, const int *idx, size_t n,
         int tmp = feat_order[i]; feat_order[i] = feat_order[j]; feat_order[j] = tmp;
     }
 
-    double best_gini = DBL_MAX;
+    double best_score = DBL_MAX;
     *out_feat = -1;
 
     int counts_all[DT_MAX_CLASSES];
-    count_classes(ds->y, idx, n, counts_all, n_classes);
+    if (!ds->is_regression)
+        count_classes(ds->y, idx, n, counts_all, n_classes);
 
     double *vals = (double *)malloc(n * sizeof(double));
     int    *sidx = (int    *)malloc(n * sizeof(int));
@@ -285,24 +385,45 @@ static int find_best_split(const Dataset *ds, const int *idx, size_t n,
         // перебор порогов — midpoint между соседними уникальными значениями
         int left_cnt [DT_MAX_CLASSES]; memset(left_cnt,  0, sizeof(left_cnt));
         int right_cnt[DT_MAX_CLASSES];
-        memcpy(right_cnt, counts_all, (size_t)n_classes * sizeof(int));
+        if (!ds->is_regression)
+            memcpy(right_cnt, counts_all, (size_t)n_classes * sizeof(int));
 
         for (size_t k = 0; k < n - 1; k++) {
-            int c = ds->y[idx[sidx[k]]];
-            left_cnt[c]++;
-            right_cnt[c]--;
+            if (!ds->is_regression) {
+                int c = ds->y[idx[sidx[k]]];
+                left_cnt[c]++;
+                right_cnt[c]--;
+            }
 
             if (vals[k] >= vals[k+1] - 1e-10) continue;
 
             double thr = (vals[k] + vals[k+1]) * 0.5;
             int nl = (int)(k + 1), nr = (int)(n - k - 1);
+            double score;
 
-            // взвешенный Джини двух дочерних узлов
-            double g = ((double)nl * dt_gini(left_cnt,  n_classes, nl) +
-                        (double)nr * dt_gini(right_cnt, n_classes, nr)) / (double)n;
+            if (ds->is_regression) {
+                int *left_tmp = (int *)malloc((size_t)nl * sizeof(int));
+                int *right_tmp = (int *)malloc((size_t)nr * sizeof(int));
+                if (!left_tmp || !right_tmp) {
+                    free(left_tmp); free(right_tmp);
+                    continue;
+                }
+                for (int i = 0; i < nl; i++)
+                    left_tmp[i] = idx[sidx[i]];
+                for (int i = 0; i < nr; i++)
+                    right_tmp[i] = idx[sidx[nl + i]];
 
-            if (g < best_gini) {
-                best_gini = g;
+                score = ((double)nl * mse_target(ds->y_reg, left_tmp, (size_t)nl) +
+                         (double)nr * mse_target(ds->y_reg, right_tmp, (size_t)nr)) / (double)n;
+                free(left_tmp);
+                free(right_tmp);
+            } else {
+                score = ((double)nl * class_impurity(left_cnt,  n_classes, nl, criterion) +
+                         (double)nr * class_impurity(right_cnt, n_classes, nr, criterion)) / (double)n;
+            }
+
+            if (score < best_score) {
+                best_score = score;
                 *out_feat = f;
                 *out_thr  = thr;
             }
@@ -322,28 +443,34 @@ static DTNode *build_node(const Dataset *ds, const int *idx, size_t n,
 
     // критерии остановки: глубина, мало образцов, узел чистый
     if (n < (size_t)dt->min_samples_split || depth >= dt->max_depth)
-        return make_leaf(ds->y, idx, n, n_classes);
+        return make_leaf(ds, idx, n);
 
-    int counts[DT_MAX_CLASSES];
-    count_classes(ds->y, idx, n, counts, n_classes);
-    int nonzero = 0;
-    for (int c = 0; c < n_classes; c++) if (counts[c]) nonzero++;
-    if (nonzero <= 1) return make_leaf(ds->y, idx, n, n_classes);
+    if (ds->is_regression) {
+        if (mse_target(ds->y_reg, idx, n) < 1e-12)
+            return make_leaf(ds, idx, n);
+    } else {
+        int counts[DT_MAX_CLASSES];
+        count_classes(ds->y, idx, n, counts, n_classes);
+        int nonzero = 0;
+        for (int c = 0; c < n_classes; c++) if (counts[c]) nonzero++;
+        if (nonzero <= 1) return make_leaf(ds, idx, n);
+    }
 
     int    best_feat = -1;
     double best_thr  = 0.0;
     int n_feat_try   = dt->n_features_split > 0
                        ? dt->n_features_split : (int)ds->n_features;
 
-    if (!find_best_split(ds, idx, n, n_feat_try, rng, &best_feat, &best_thr))
-        return make_leaf(ds->y, idx, n, n_classes);
+    if (!find_best_split(ds, idx, n, n_feat_try, rng, dt->criterion,
+                         &best_feat, &best_thr))
+        return make_leaf(ds, idx, n);
 
     // делим индексы на левую и правую ветки
     int *left_idx  = (int *)malloc(n * sizeof(int));
     int *right_idx = (int *)malloc(n * sizeof(int));
     if (!left_idx || !right_idx) {
         free(left_idx); free(right_idx);
-        return make_leaf(ds->y, idx, n, n_classes);
+        return make_leaf(ds, idx, n);
     }
 
     size_t nl = 0, nr = 0;
@@ -356,7 +483,7 @@ static DTNode *build_node(const Dataset *ds, const int *idx, size_t n,
 
     if (nl == 0 || nr == 0) {
         free(left_idx); free(right_idx);
-        return make_leaf(ds->y, idx, n, n_classes);
+        return make_leaf(ds, idx, n);
     }
 
     DTNode *node = (DTNode *)calloc(1, sizeof(DTNode));
@@ -389,12 +516,22 @@ static void free_node(DTNode *node)
 DecisionTree *dt_create(size_t max_depth, int min_samples_split,
                          int n_features_split, unsigned int seed)
 {
+    return dt_create_ex(max_depth, min_samples_split, n_features_split, seed,
+                        DT_TASK_CLASSIFICATION, DT_CRITERION_GINI);
+}
+
+DecisionTree *dt_create_ex(size_t max_depth, int min_samples_split,
+                            int n_features_split, unsigned int seed,
+                            DTTask task, DTCriterion criterion)
+{
     DecisionTree *dt = (DecisionTree *)calloc(1, sizeof(DecisionTree));
     if (!dt) return NULL;
     dt->max_depth         = max_depth > 0 ? max_depth : 10;
     dt->min_samples_split = min_samples_split > 1 ? min_samples_split : 2;
     dt->n_features_split  = n_features_split;
     dt->seed              = seed;
+    dt->task              = task;
+    dt->criterion         = task == DT_TASK_REGRESSION ? DT_CRITERION_MSE : criterion;
     return dt;
 }
 
@@ -409,6 +546,7 @@ void dt_fit(DecisionTree *dt, const Dataset *ds,
             const int *indices, size_t n_idx)
 {
     assert(dt && ds && indices && n_idx > 0);
+    assert((dt->task == DT_TASK_REGRESSION) == (ds->is_regression != 0));
     free_node(dt->root);
 
     unsigned int rng = dt->seed;
@@ -426,6 +564,7 @@ void dt_fit(DecisionTree *dt, const Dataset *ds,
 int dt_predict(const DecisionTree *dt, const double *x)
 {
     assert(dt && x);
+    assert(dt->task == DT_TASK_CLASSIFICATION);
     const DTNode *node = dt->root;
     if (!node) return -1;
 
@@ -439,10 +578,36 @@ int dt_predict(const DecisionTree *dt, const double *x)
     return node->class_label;
 }
 
+double dt_predict_value(const DecisionTree *dt, const double *x)
+{
+    assert(dt && x);
+    assert(dt->task == DT_TASK_REGRESSION);
+    const DTNode *node = dt->root;
+    if (!node) return 0.0;
+
+    while (!node->is_leaf) {
+        if (x[node->feature_idx] <= node->threshold)
+            node = node->left;
+        else
+            node = node->right;
+        if (!node) return 0.0;
+    }
+    return node->value;
+}
+
 //  Bagging — публичный API 
 
 BaggingClassifier *bag_create(size_t n_trees, size_t max_depth,
                                int min_samples_split, unsigned int seed)
+{
+    return bag_create_ex(n_trees, max_depth, min_samples_split, seed,
+                         DT_TASK_CLASSIFICATION, DT_CRITERION_GINI, n_trees);
+}
+
+BaggingClassifier *bag_create_ex(size_t n_trees, size_t max_depth,
+                                  int min_samples_split, unsigned int seed,
+                                  DTTask task, DTCriterion criterion,
+                                  size_t n_vote_trees)
 {
     assert(n_trees > 0);
     BaggingClassifier *bc = (BaggingClassifier *)calloc(1, sizeof(BaggingClassifier));
@@ -455,6 +620,10 @@ BaggingClassifier *bag_create(size_t n_trees, size_t max_depth,
     bc->seed              = seed;
     bc->max_depth         = max_depth;
     bc->min_samples_split = min_samples_split;
+    bc->task              = task;
+    bc->criterion         = task == DT_TASK_REGRESSION ? DT_CRITERION_MSE : criterion;
+    bc->n_vote_trees      = (n_vote_trees > 0 && n_vote_trees < n_trees)
+                            ? n_vote_trees : n_trees;
     return bc;
 }
 
@@ -470,6 +639,7 @@ void bag_free(BaggingClassifier *bc)
 void bag_fit(BaggingClassifier *bc, const Dataset *ds)
 {
     assert(bc && ds && ds->n_samples > 0);
+    assert((bc->task == DT_TASK_REGRESSION) == (ds->is_regression != 0));
     bc->n_classes = ds->n_classes;
 
     unsigned int rng = bc->seed;
@@ -486,36 +656,91 @@ void bag_fit(BaggingClassifier *bc, const Dataset *ds)
         for (size_t i = 0; i < ds->n_samples; i++)
             bootstrap[i] = lcg_range(&rng, 0, (int)ds->n_samples);
 
-        bc->trees[t] = dt_create(bc->max_depth, bc->min_samples_split,
-                                  n_feat_split, tree_seed);
+        bc->trees[t] = dt_create_ex(bc->max_depth, bc->min_samples_split,
+                                    n_feat_split, tree_seed,
+                                    bc->task, bc->criterion);
         if (!bc->trees[t]) continue;
         dt_fit(bc->trees[t], ds, bootstrap, ds->n_samples);
     }
     free(bootstrap);
 }
 
+static void shuffled_tree_order(size_t *order, size_t n, unsigned int seed)
+{
+    for (size_t i = 0; i < n; i++) order[i] = i;
+    for (size_t i = n; i > 1; i--) {
+        size_t j = (size_t)lcg_range(&seed, 0, (int)i);
+        size_t tmp = order[i - 1];
+        order[i - 1] = order[j];
+        order[j] = tmp;
+    }
+}
+
 // мажоритарное голосование всех деревьев
 int bag_predict(const BaggingClassifier *bc, const double *x)
 {
     assert(bc && x && bc->n_classes > 0);
+    assert(bc->task == DT_TASK_CLASSIFICATION);
     int votes[DT_MAX_CLASSES] = {0};
-    for (size_t t = 0; t < bc->n_trees; t++) {
+    size_t *order = (size_t *)malloc(bc->n_trees * sizeof(size_t));
+    if (!order) return 0;
+    shuffled_tree_order(order, bc->n_trees, bc->seed + 991u);
+
+    size_t used = 0;
+    for (size_t i = 0; i < bc->n_trees && used < bc->n_vote_trees; i++) {
+        size_t t = order[i];
         if (!bc->trees[t]) continue;
         int pred = dt_predict(bc->trees[t], x);
         if (pred >= 0 && pred < bc->n_classes)
             votes[pred]++;
+        used++;
     }
+    free(order);
     return majority(votes, bc->n_classes);
+}
+
+double bag_predict_value(const BaggingClassifier *bc, const double *x)
+{
+    assert(bc && x);
+    assert(bc->task == DT_TASK_REGRESSION);
+    size_t *order = (size_t *)malloc(bc->n_trees * sizeof(size_t));
+    if (!order) return 0.0;
+    shuffled_tree_order(order, bc->n_trees, bc->seed + 991u);
+
+    double sum = 0.0;
+    size_t used = 0;
+    for (size_t i = 0; i < bc->n_trees && used < bc->n_vote_trees; i++) {
+        size_t t = order[i];
+        if (!bc->trees[t]) continue;
+        sum += dt_predict_value(bc->trees[t], x);
+        used++;
+    }
+    free(order);
+    return used > 0 ? sum / (double)used : 0.0;
 }
 
 // доля правильных предсказаний на датасете
 double bag_score(const BaggingClassifier *bc, const Dataset *ds)
 {
     assert(bc && ds);
+    assert(bc->task == DT_TASK_CLASSIFICATION);
     if (ds->n_samples == 0) return 0.0;
     int correct = 0;
     for (size_t i = 0; i < ds->n_samples; i++) {
         if (bag_predict(bc, ds->X[i]) == ds->y[i]) correct++;
     }
     return (double)correct / (double)ds->n_samples;
+}
+
+double bag_rmse(const BaggingClassifier *bc, const Dataset *ds)
+{
+    assert(bc && ds);
+    assert(bc->task == DT_TASK_REGRESSION);
+    if (ds->n_samples == 0) return 0.0;
+    double err = 0.0;
+    for (size_t i = 0; i < ds->n_samples; i++) {
+        double d = bag_predict_value(bc, ds->X[i]) - ds->y_reg[i];
+        err += d * d;
+    }
+    return sqrt(err / (double)ds->n_samples);
 }

@@ -2,8 +2,10 @@
 //
 // Использование:
 //   ./robot_dt demo
-//   ./robot_dt train  <dataset.csv> [n_trees] [max_depth]
+//   ./robot_dt train  <dataset.csv> [n_trees] [max_depth] [gini|entropy] [vote_trees]
 //   ./robot_dt predict <dataset.csv> <f1> <f2> ... <fN>
+//   ./robot_dt train-reg <dataset.csv> [n_trees] [max_depth] [vote_trees]
+//   ./robot_dt predict-reg <dataset.csv> <f1> <f2> ... <fN>
 
 #include "decision_tree.h"
 
@@ -11,7 +13,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-//  Встроенная демонстрация 
+static DTCriterion parse_criterion(const char *s)
+{
+    if (s && strcmp(s, "entropy") == 0) return DT_CRITERION_ENTROPY;
+    return DT_CRITERION_GINI;
+}
+
+static const char *criterion_name(DTCriterion c)
+{
+    return c == DT_CRITERION_ENTROPY ? "entropy" : "gini";
+}
+
+//  Встроенная демонстрация
 // Признаки: [расстояние до препятствия, скорость, угол, заряд]
 // Классы:   forward / turn_left / turn_right / stop
 static void run_demo(void)
@@ -61,7 +74,9 @@ static void run_demo(void)
 
     // одиночное дерево
     puts("--- Single Decision Tree ---");
-    DecisionTree *dt = dt_create(5, 2, 2, 42u);
+    DecisionTree *dt = dt_create_ex(5, 2, 2, 42u,
+                                    DT_TASK_CLASSIFICATION,
+                                    DT_CRITERION_ENTROPY);
     dt_fit(dt, ds, all_idx, (size_t)N);
 
     double test1[4] = {4.5, 0.8,  2.0, 0.8};
@@ -78,8 +93,10 @@ static void run_demo(void)
     dt_free(dt);
 
     // бэггинг
-    puts("\n--- Bagging Classifier (10 trees) ---");
-    BaggingClassifier *bc = bag_create(10, 5, 2, 7u);
+    puts("\n--- Bagging Classifier (10 trees, 7 random vote trees) ---");
+    BaggingClassifier *bc = bag_create_ex(10, 5, 2, 7u,
+                                          DT_TASK_CLASSIFICATION,
+                                          DT_CRITERION_ENTROPY, 7);
     bag_fit(bc, ds);
 
     printf("  Train accuracy: %.1f%%\n", bag_score(bc, ds) * 100.0);
@@ -97,19 +114,21 @@ static void run_demo(void)
     puts("\nDemo complete.");
 }
 
-//  Команда train 
+//  Команда train
 static void cmd_train(int argc, char *argv[])
 {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s train <dataset.csv> [n_trees] [max_depth]\n", argv[0]);
+        fprintf(stderr, "Usage: %s train <dataset.csv> [n_trees] [max_depth] [gini|entropy] [vote_trees]\n", argv[0]);
         return;
     }
     const char *path    = argv[2];
     int         n_trees = argc > 3 ? atoi(argv[3]) : 10;
     int         depth   = argc > 4 ? atoi(argv[4]) : 5;
+    DTCriterion criterion = argc > 5 ? parse_criterion(argv[5]) : DT_CRITERION_GINI;
+    int         vote_trees = argc > 6 ? atoi(argv[6]) : n_trees;
 
-    if (n_trees < 1 || depth < 1) {
-        fputs("n_trees и max_depth должны быть >= 1\n", stderr);
+    if (n_trees < 1 || depth < 1 || vote_trees < 1) {
+        fputs("n_trees, max_depth и vote_trees должны быть >= 1\n", stderr);
         return;
     }
 
@@ -119,9 +138,12 @@ static void cmd_train(int argc, char *argv[])
 
     printf("Образцов: %zu  Признаков: %zu  Классов: %d\n",
            ds->n_samples, ds->n_features, ds->n_classes);
-    printf("Обучение (%d деревьев, глубина %d)...\n", n_trees, depth);
+    printf("Обучение (%d деревьев, глубина %d, критерий %s, голосуют %d деревьев)...\n",
+           n_trees, depth, criterion_name(criterion), vote_trees);
 
-    BaggingClassifier *bc = bag_create((size_t)n_trees, (size_t)depth, 2, 42u);
+    BaggingClassifier *bc = bag_create_ex((size_t)n_trees, (size_t)depth, 2, 42u,
+                                          DT_TASK_CLASSIFICATION, criterion,
+                                          (size_t)vote_trees);
     if (!bc) { fputs("Out of memory\n", stderr); dataset_free(ds); return; }
 
     bag_fit(bc, ds);
@@ -131,7 +153,7 @@ static void cmd_train(int argc, char *argv[])
     dataset_free(ds);
 }
 
-//  Команда predict 
+//  Команда predict
 static void cmd_predict(int argc, char *argv[])
 {
     if (argc < 4) {
@@ -153,7 +175,9 @@ static void cmd_predict(int argc, char *argv[])
     for (size_t i = 0; i < n_feat; i++)
         x[i] = atof(argv[3 + (int)i]);
 
-    BaggingClassifier *bc = bag_create(10, 5, 2, 42u);
+    BaggingClassifier *bc = bag_create_ex(10, 5, 2, 42u,
+                                          DT_TASK_CLASSIFICATION,
+                                          DT_CRITERION_GINI, 10);
     if (!bc) { free(x); dataset_free(ds); return; }
     bag_fit(bc, ds);
 
@@ -166,14 +190,88 @@ static void cmd_predict(int argc, char *argv[])
     dataset_free(ds);
 }
 
-//  Точка входа 
+//  Команда train-reg
+static void cmd_train_reg(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s train-reg <dataset.csv> [n_trees] [max_depth] [vote_trees]\n", argv[0]);
+        return;
+    }
+    const char *path    = argv[2];
+    int         n_trees = argc > 3 ? atoi(argv[3]) : 20;
+    int         depth   = argc > 4 ? atoi(argv[4]) : 6;
+    int         vote_trees = argc > 5 ? atoi(argv[5]) : n_trees;
+
+    if (n_trees < 1 || depth < 1 || vote_trees < 1) {
+        fputs("n_trees, max_depth и vote_trees должны быть >= 1\n", stderr);
+        return;
+    }
+
+    printf("Загрузка регрессионного датасета: %s\n", path);
+    Dataset *ds = dataset_load_csv_regression(path, 1);
+    if (!ds) { fputs("Ошибка загрузки\n", stderr); return; }
+
+    printf("Образцов: %zu  Признаков: %zu\n", ds->n_samples, ds->n_features);
+    printf("Обучение регрессии (%d деревьев, глубина %d, MSE, голосуют %d деревьев)...\n",
+           n_trees, depth, vote_trees);
+
+    BaggingClassifier *bc = bag_create_ex((size_t)n_trees, (size_t)depth, 2, 42u,
+                                          DT_TASK_REGRESSION, DT_CRITERION_MSE,
+                                          (size_t)vote_trees);
+    if (!bc) { fputs("Out of memory\n", stderr); dataset_free(ds); return; }
+
+    bag_fit(bc, ds);
+    printf("RMSE на обучающей выборке: %.4f\n", bag_rmse(bc, ds));
+
+    bag_free(bc);
+    dataset_free(ds);
+}
+
+//  Команда predict-reg
+static void cmd_predict_reg(int argc, char *argv[])
+{
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s predict-reg <dataset.csv> <f1> [f2 ...]\n", argv[0]);
+        return;
+    }
+
+    Dataset *ds = dataset_load_csv_regression(argv[2], 1);
+    if (!ds) { fputs("Ошибка загрузки\n", stderr); return; }
+
+    size_t n_feat = ds->n_features;
+    if ((size_t)(argc - 3) < n_feat) {
+        fprintf(stderr, "Нужно %zu значений признаков, получено %d\n", n_feat, argc - 3);
+        dataset_free(ds); return;
+    }
+
+    double *x = (double *)malloc(n_feat * sizeof(double));
+    if (!x) { fputs("Out of memory\n", stderr); dataset_free(ds); return; }
+    for (size_t i = 0; i < n_feat; i++)
+        x[i] = atof(argv[3 + (int)i]);
+
+    BaggingClassifier *bc = bag_create_ex(20, 6, 2, 42u,
+                                          DT_TASK_REGRESSION,
+                                          DT_CRITERION_MSE, 20);
+    if (!bc) { free(x); dataset_free(ds); return; }
+    bag_fit(bc, ds);
+
+    printf("Предсказанное значение: %.4f\n", bag_predict_value(bc, x));
+
+    bag_free(bc);
+    free(x);
+    dataset_free(ds);
+}
+
+//  Точка входа
 static void print_usage(const char *prog)
 {
     printf("Использование:\n"
            "  %s demo\n"
-           "  %s train  <dataset.csv> [n_trees] [max_depth]\n"
-           "  %s predict <dataset.csv> <f1> [f2 ...]\n",
-           prog, prog, prog);
+           "  %s train  <dataset.csv> [n_trees] [max_depth] [gini|entropy] [vote_trees]\n"
+           "  %s predict <dataset.csv> <f1> [f2 ...]\n"
+           "  %s train-reg <dataset.csv> [n_trees] [max_depth] [vote_trees]\n"
+           "  %s predict-reg <dataset.csv> <f1> [f2 ...]\n",
+           prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[])
@@ -183,6 +281,8 @@ int main(int argc, char *argv[])
     if      (strcmp(argv[1], "demo")    == 0) run_demo();
     else if (strcmp(argv[1], "train")   == 0) cmd_train(argc, argv);
     else if (strcmp(argv[1], "predict") == 0) cmd_predict(argc, argv);
+    else if (strcmp(argv[1], "train-reg") == 0) cmd_train_reg(argc, argv);
+    else if (strcmp(argv[1], "predict-reg") == 0) cmd_predict_reg(argc, argv);
     else {
         fprintf(stderr, "Неизвестная команда: %s\n", argv[1]);
         print_usage(argv[0]);
